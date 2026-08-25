@@ -1,0 +1,5 @@
+*.hex
+*.elf
+*.json
+*.bin
+*.exe
