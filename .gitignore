@@ -3,3 +3,10 @@
 *.json
 *.bin
 *.exe
+*.stl
+*.png
+*.glb
+*.py
+*.txt
+*.md
+*.pdf
