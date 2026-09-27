@@ -9,13 +9,35 @@
  *   MAX9814 VDD=regulated 5V, GND=common, OUT=PA2, GAIN=VDD, A/R=GND.
  *   AVCC pin 30=5V; AREF pin 32=100nF to GND (no external voltage).
  *   Never wire AREF directly to GND. AVCC is required even with MIC_ENABLED=0.
- * Remove L298N ENA/ENB jumpers. No automatic reverse is used.
+ * Remove L298N ENA/ENB jumpers. The only automatic reverse is a short,
+ * capped backup away from a latched cliff (STATE_CLIFF_BACKUP below);
+ * every other state still only ever drives forward.
  *
  * ADDED (all on free PORTC pins; JTAG is already disabled by shock_init()):
  *   KY-040 CLK PC4, DT PC5, SW PC6 (+ to 5V, GND common).
  *   DHT11 DATA PC7 (needs a 4.7-10 k pull-up to 5V; 3-pin modules have one).
  *   KY-040: turn = pick a mode, push = select (or exit Weather Mode).
  *   Modes: ROAM (the unchanged autonomous FSM) and WEATHER (stationary).
+ *
+ * ADDED: a second front IR cliff sensor, so both front corners are covered
+ * (same electrical convention as the original: LOW = cliff, HIGH = surface,
+ * polarity still selected by IR_CLIFF_LEVEL):
+ *   IR front-left  OUT PB0 (the original sensor, kept as-is)
+ *   IR front-right OUT PB4
+ * Same internal pull-up convention as the original sensor. Either one
+ * latching still brakes immediately, exactly as before (see ir_cliff_now()).
+ * What's new is only what happens next: instead of always reversing
+ * straight back once, STATE_CLIFF_BACKUP rotates away from whichever front
+ * corner tripped (or reverses straight if both trip together), retries with
+ * a progressively longer move (capped) if the edge doesn't clear, and once
+ * it does, STATE_CLIFF_TURN adds a short bounded heading correction away
+ * from that side before cruising resumes -- so it comes back facing away
+ * from the edge instead of straight back toward it. See the comments above
+ * cliff_backup_start() and above STATE_CLIFF_TURN's case in robot_enter()
+ * for the exact logic. This is still fundamentally a binary "is there floor
+ * right here" sensor pair, not a distance sensor: it cannot see an edge
+ * before the front is over it, and cannot protect the sides/wheel paths
+ * during ordinary driving turns.
  *
  * Build (avr-gcc/avr-libc installed):
  * avr-gcc -mmcu=atmega32 -std=gnu99 -Os -Wall -Wextra -Werror \
@@ -25,8 +47,10 @@
  *
  * Test with wheels raised, then at floor level with a tether/catch surface.
  * PWM duty is NOT measured wheel speed. Tune to the actual loaded robot.
- * Braking is not zero stopping distance; a single IR sensor cannot protect
- * both wheel paths during a turn or distinguish all dark floors from cliffs.
+ * Braking is not zero stopping distance; two front IR sensors still cannot
+ * protect the wheel paths mid-turn or distinguish every dark floor from a
+ * real cliff. Verify the FL/FR wiring against physical corners before
+ * trusting the turn-away direction -- a swapped pair steers INTO the drop.
  * L298 braking current must remain within the driver's/motor's limits.
  */
 #ifndef F_CPU
@@ -61,7 +85,42 @@
 #ifndef IR_CLIFF_LEVEL
 #define IR_CLIFF_LEVEL                1u   /* 0: LOW=cliff; 1: HIGH=cliff. */
 #endif
+/* One corner sensor per PORTB pin; see the wiring comment at the top. */
+#define IR_FL_PIN                    PB0   /* Front-left  (original sensor). */
+#define IR_FR_PIN                    PB4   /* Front-right. */
 #define IR_SURFACE_STABLE_TICKS     150u   /* 307 ms before cliff recovery. */
+#define CLIFF_CONFIRM_TICKS          90u   /* ~184 ms braked before backing up;
+                                             * lets a one-sample glitch clear
+                                             * on its own without moving. */
+#define CLIFF_BACKUP_SPEED            50u  /* Modest reverse/forward PWM for
+                                             * the outer (far-side) wheel. */
+#define CLIFF_BACKUP_TURN_SPEED       18u  /* Inner (cliff-side) wheel speed
+                                             * when only one corner latched:
+                                             * slower than CLIFF_BACKUP_SPEED
+                                             * so the move pivots away from
+                                             * that corner instead of going
+                                             * straight. Both sensors on the
+                                             * same end (e.g. FL+FR) still
+                                             * get an equal, straight move. */
+#define CLIFF_BACKUP_TICKS           200u  /* ~410 ms reverse on the first
+                                             * attempt: "a small moment". */
+#define CLIFF_BACKUP_TICKS_GROWTH     70u  /* Added per retry (see below):
+                                             * a corner the first modest
+                                             * backup didn't clear gets a
+                                             * longer one next time instead
+                                             * of repeating the same move. */
+#define CLIFF_BACKUP_TICKS_MAX       480u  /* Cap on the growth above. */
+#define CLIFF_BACKUP_MAX_ATTEMPTS      5u  /* Then stay braked; no endless
+                                             * shuffling back and forth. */
+#define CLIFF_TURN_TICKS             180u  /* ~369 ms heading correction, away
+                                             * from whichever side tripped,
+                                             * once the edge is confirmed
+                                             * clear -- so cruising resumes
+                                             * pointed away from the edge
+                                             * instead of straight back
+                                             * toward it. Skipped when both
+                                             * sensors tripped together
+                                             * (no side to prefer). */
 #define SETTLE_TICKS                170u   /* 348 ms before resuming. */
 #define TURN_TIMEOUT_TICKS         1953u   /* About 4 s, then brake/wait. */
 #define STARTUP_TICKS               250u
@@ -90,12 +149,22 @@
 #define STARTLE_PAUSE_TICKS         240u   /* 491.5 ms; no blocking delay. */
 #define DIZZY_PAUSE_TICKS           500u   /* About 1.02 s of dizziness. */
 #define SHOCK_ACTIVE_LOW              1u   /* Common modules: DO LOW on shock. */
-#define SHOCK_REARM_TICKS            25u   /* About 51 ms quiet before re-arm. */
+#define SHOCK_REARM_TICKS             10u  /* About 20 ms quiet before re-arm:
+                                             * the sensitivity/responsiveness
+                                             * knob -- see the comment above
+                                             * shock_sample_isr() below. */
 
 #define SERVO_HOME_TICKS             125u  /* 1.000 ms at 8 us/tick */
 #define SERVO_CLIFF_TICKS            188u  /* 1.504 ms: about 90 degrees */
 #define SERVO_PET_TICKS              145u  /* 1.160 ms: gentle petting wiggle */
 #define SERVO_PET_HALF_PERIOD_TICKS  120u  /* About 246 ms each way. */
+#define SERVO_ACTIVE_HOLD_TICKS      200u  /* ~410 ms of pulses after any
+                                             * target change -- enough for a
+                                             * full sweep plus settle -- then
+                                             * pulses stop until the next
+                                             * change, so the servos aren't
+                                             * driven/buzzing while just
+                                             * holding a steady position. */
 
 #define SH1106_COLUMN_OFFSET         2u
 #define OLED_EYE_X                   24u
@@ -168,6 +237,12 @@
 #if IR_CLIFF_LEVEL != 0 && IR_CLIFF_LEVEL != 1
 #error "IR_CLIFF_LEVEL must be 0 or 1"
 #endif
+#if CLIFF_BACKUP_TURN_SPEED >= CLIFF_BACKUP_SPEED
+#error "CLIFF_BACKUP_TURN_SPEED must be slower than CLIFF_BACKUP_SPEED to turn"
+#endif
+#if CLIFF_BACKUP_TICKS_MAX < CLIFF_BACKUP_TICKS
+#error "CLIFF_BACKUP_TICKS_MAX must be >= CLIFF_BACKUP_TICKS"
+#endif
 #if MIC_MIN_P2P < 1 || MIC_MIN_P2P > 255 || MIC_RISE_P2P < 2 || \
     MIC_RISE_P2P > 127 || MIC_REARM_WINDOWS < 1 || MIC_REARM_WINDOWS > 255
 #error "Use valid 8-bit microphone thresholds and a nonzero re-arm count"
@@ -214,6 +289,10 @@ typedef enum {
     STATE_SETTLE,
     STATE_PETTING,
     STATE_CLIFF,
+    STATE_CLIFF_BACKUP,     /* Bounded reverse away from a latched cliff. */
+    STATE_CLIFF_TURN,       /* Bounded heading correction once clear, away
+                             * from whichever side tripped, before resuming
+                             * normal cruising. */
     STATE_BLOCKED,
     STATE_SENSOR_WAIT,
     STATE_STARTLED,
@@ -237,11 +316,47 @@ static uint8_t ui_dirty = 0u;
 
 static volatile uint8_t cliff_latched = 1u;
 static volatile uint8_t surface_stable_ticks = 0u;
+/* Normally ANY cliff reading forces an immediate brake, no exceptions -- see
+ * the ISR and motors_service() below. This flag is the one deliberate,
+ * tightly-scoped carve-out: while STATE_CLIFF_BACKUP has it set, a bounded
+ * reverse move is allowed to run despite cliff_latched being true, so the
+ * robot can back away from an edge it would otherwise sit at forever (the
+ * sensor never clears on its own if the robot never moves). robot_enter()
+ * is the only place that sets or clears it, and it defaults to 0 on every
+ * single state change, so it can never stay "on" outside that one state. */
+static volatile uint8_t cliff_backup_authorized = 0u;
 
-/* All four safety checks use this same polarity, including the Timer2 ISR. */
+/* Bit assignment for the 2-sensor cliff bitmask returned by ir_cliff_mask().
+ * Used only to pick a backup direction; every safety latch/brake path below
+ * still treats "either sensor" the same as the original single-sensor code. */
+#define CLIFF_BIT_FL                  _BV(0)
+#define CLIFF_BIT_FR                  _BV(1)
+
+/* Reads both front corner sensors and returns which one(s) currently see a
+ * cliff, using the same IR_CLIFF_LEVEL polarity as the original sensor.
+ * Single register read (PINB), so this is safe to call from the ISR or
+ * from the main loop without disabling interrupts, exactly like the old
+ * single-pin ir_cliff_now() it replaces here. */
+static inline uint8_t ir_cliff_mask(void)
+{
+    uint8_t m = 0u;
+    if (((PINB & _BV(IR_FL_PIN)) ? 1u : 0u) == IR_CLIFF_LEVEL) {
+        m |= CLIFF_BIT_FL;
+    }
+    if (((PINB & _BV(IR_FR_PIN)) ? 1u : 0u) == IR_CLIFF_LEVEL) {
+        m |= CLIFF_BIT_FR;
+    }
+    return m;
+}
+
+/* Both safety checks use this same polarity, including the Timer2 ISR.
+ * Preserved name/signature: true the instant EITHER sensor sees a cliff,
+ * same as the original single-sensor behavior, so every existing call site
+ * (ISR latch, motors_service() brake gate, cliff_release_if_safe(), the
+ * STARTUP check) stays correct with no changes of its own. */
 static inline uint8_t ir_cliff_now(void)
 {
-    return ((PINB & _BV(PB0)) ? 1u : 0u) == IR_CLIFF_LEVEL;
+    return ir_cliff_mask() != 0u;
 }
 
 /* ------------------------------- Motors ------------------------------ */
@@ -259,9 +374,15 @@ static volatile motor_hw_mode_t motor_hw_mode = MOTOR_BRAKED;
 static uint8_t motor_target_a = 0, motor_target_b = 0;
 static uint8_t motor_current_a = 0, motor_current_b = 0;
 static uint16_t motor_arm_since = 0, motor_last_ramp = 0;
+/* Direction latched at the ARMING -> RUNNING transition below. 0 = forward
+ * (the only direction this firmware used to drive), 1 = reverse. Only
+ * motors_set_targets_reverse() (the cliff-backup maneuver) ever sets this. */
+static volatile uint8_t motor_reverse = 0u;
 
 #define MOTOR_DIRECTION_MASK (_BV(PD1) | _BV(PD2) | _BV(PD3) | _BV(PD6))
 #define MOTOR_ENABLE_MASK (_BV(PD4) | _BV(PD5))
+#define MOTOR_FORWARD_BITS (_BV(PD2) | _BV(PD1))   /* IN1 + IN4 high. */
+#define MOTOR_REVERSE_BITS (_BV(PD3) | _BV(PD6))   /* IN2 + IN3 high. */
 
 /* Caller has interrupts disabled (main atomic section or ISR). */
 static inline void motors_brake_now(void)
@@ -298,6 +419,19 @@ static void motors_init(void)
 
 static void motors_set_targets(uint8_t speed_a, uint8_t speed_b)
 {
+    motor_reverse = 0u;
+    motor_target_a = speed_a;
+    motor_target_b = speed_b;
+    if (!speed_a && !speed_b) {
+        motors_brake();
+    }
+}
+
+/* Used only by the bounded STATE_CLIFF_BACKUP maneuver below -- everywhere
+ * else in the firmware still only ever drives forward, unchanged. */
+static void motors_set_targets_reverse(uint8_t speed_a, uint8_t speed_b)
+{
+    motor_reverse = 1u;
     motor_target_a = speed_a;
     motor_target_b = speed_b;
     if (!speed_a && !speed_b) {
@@ -336,12 +470,14 @@ static void motors_service(uint16_t now)
     uint8_t saved_sreg = SREG;
     cli();
 
-    /* Never let a stale main-loop command undo an interrupt's cliff stop. */
+    /* Never let a stale main-loop command undo an interrupt's cliff stop.
+     * cliff_backup_authorized is the one deliberate, bounded exception: it
+     * lets STATE_CLIFF_BACKUP's reverse move run despite cliff_latched. */
     if (ir_cliff_now()) {
         cliff_latched = 1u;
         surface_stable_ticks = 0u;
     }
-    if (cliff_latched ||
+    if ((cliff_latched && !cliff_backup_authorized) ||
         (!motor_target_a && !motor_target_b)) {
         motors_brake_now();
         motor_current_a = motor_current_b = 0;
@@ -362,7 +498,8 @@ static void motors_service(uint16_t now)
     } else if (motor_hw_mode == MOTOR_ARMING) {
         if ((uint16_t)(now - motor_arm_since) >= MOTOR_PWM_ARM_TICKS) {
             PORTD = (uint8_t)((PORTD & (uint8_t)~MOTOR_DIRECTION_MASK) |
-                             _BV(PD2) | _BV(PD1));
+                             (motor_reverse ? MOTOR_REVERSE_BITS
+                                            : MOTOR_FORWARD_BITS));
             motor_hw_mode = MOTOR_RUNNING;
             motor_last_ramp = now;
         }
@@ -376,13 +513,14 @@ static void motors_service(uint16_t now)
     SREG = saved_sreg;
 }
 
-/* -------------------------- Cliff IR sensor -------------------------- */
-/* PB0 polarity is selected only by IR_CLIFF_LEVEL above. */
+/* ------------------------ Cliff IR sensors (x2) ----------------------- */
+/* Polarity for both front corners is selected only by IR_CLIFF_LEVEL above. */
 
 static void ir_init(void)
 {
-    DDRB &= (uint8_t)~_BV(PB0);
-    PORTB |= _BV(PB0);                 /* Retain the existing input pull-up. */
+    DDRB &= (uint8_t)~(_BV(IR_FL_PIN) | _BV(IR_FR_PIN));
+    PORTB |= _BV(IR_FL_PIN) | _BV(IR_FR_PIN); /* Same pull-up convention as
+                                                * the original PB0 sensor. */
 }
 
 /* --------------------------- Two servos ------------------------------ */
@@ -395,6 +533,17 @@ static volatile uint16_t system_ticks_2ms = 0;
 
 static inline void shock_sample_isr(void);
 static inline void encoder_sample_isr(void);
+
+static volatile uint8_t servo_pulses_enabled = 1u; /* See servo_note_target()
+                                                     * below: pulses only run
+                                                     * for a bit after the
+                                                     * target actually
+                                                     * changes, then stop, so
+                                                     * the servos aren't
+                                                     * continuously driven
+                                                     * (and buzzing) at rest. */
+static uint8_t servo_last_seen_ticks = SERVO_HOME_TICKS;
+static uint16_t servo_change_tick = 0;
 
 static void servos_init(void)
 {
@@ -418,6 +567,24 @@ static void servos_cliff_position(void)
     servo_target_ticks = SERVO_CLIFF_TICKS;
 }
 
+/* Call once per servos_update() pass with whatever servo_target_ticks was
+ * just (re)requested. A real change (re)starts the SERVO_ACTIVE_HOLD_TICKS
+ * hold window and turns pulses back on; once that window elapses with no
+ * further change, pulses turn off until the next one. Only this function
+ * and the two ISRs below touch servo_pulses_enabled. Main-loop only (not
+ * ISR-safe), same as the rest of servos_update(). */
+static void servo_note_target(uint8_t target, uint16_t now)
+{
+    if (target != servo_last_seen_ticks) {
+        servo_last_seen_ticks = target;
+        servo_change_tick = now;
+        servo_pulses_enabled = 1u;
+    } else if (servo_pulses_enabled &&
+               (uint16_t)(now - servo_change_tick) >= SERVO_ACTIVE_HOLD_TICKS) {
+        servo_pulses_enabled = 0u;
+    }
+}
+
 ISR(TIMER2_OVF_vect)
 {
     ++system_ticks_2ms;
@@ -430,18 +597,23 @@ ISR(TIMER2_OVF_vect)
     if (ir_cliff_now()) {
         cliff_latched = 1u;
         surface_stable_ticks = 0u;
-        if (motor_hw_mode != MOTOR_BRAKED) {
+        if (!cliff_backup_authorized && motor_hw_mode != MOTOR_BRAKED) {
             motors_brake_now();
         }
     } else if (surface_stable_ticks < IR_SURFACE_STABLE_TICKS) {
         ++surface_stable_ticks;
     }
 
+    /* servo_frame_count itself always keeps counting (DHT11 timing below
+     * relies on this same frame cadence); only the actual pulse output is
+     * gated by servo_pulses_enabled. */
     if (++servo_frame_count >= 10u) {
         servo_frame_count = 0;
-        OCR2 = servo_target_ticks;
-        PORTB |= _BV(PB1) | _BV(PB2);
-        servo_pulse_active = 1;
+        if (servo_pulses_enabled) {
+            OCR2 = servo_target_ticks;
+            PORTB |= _BV(PB1) | _BV(PB2);
+            servo_pulse_active = 1;
+        }
     }
 }
 
@@ -590,7 +762,21 @@ static void microphone_service(uint16_t now)
 /* The common SW-18015P comparator module presents a digital DO signal and
  * typically goes LOW on vibration. PC3 is currently unused in this robot.
  * We sample it from the existing ~2.048 ms Timer2 ISR so a short shock pulse
- * is not lost while OLED/sonar code is running in the main loop. */
+ * is not lost while OLED/sonar code is running in the main loop.
+ *
+ * SENSITIVITY: shock_sample_isr() below already reacts on the very FIRST
+ * ~2.048 ms sample where DO reads active -- that's as fast as this firmware
+ * can possibly notice a shock, so there is no software "threshold" to lower
+ * for a single shake. The one sensitivity-related knob in code is
+ * SHOCK_REARM_TICKS above: it's how long DO must read quiet again before the
+ * NEXT shake is allowed to register, so lowering it (already done above)
+ * makes repeated/ongoing shaking register more readily. If a single firm
+ * shake still needs to be hard before anything happens, that threshold is
+ * set on the sensor module itself: most SW-18015P breakout boards have a
+ * small onboard trimmer potentiometer feeding the comparator's reference --
+ * turn it toward the more-sensitive direction (consult your specific
+ * board's silkscreen/markings) rather than looking for another macro here.
+ */
 static volatile uint8_t shock_event_pending = 0;
 static volatile uint8_t shock_armed = 1u;
 static volatile uint8_t shock_rearm_ticks = 0u;
@@ -807,6 +993,7 @@ static void servos_update(action_t action, touch_state_t touch,
         petting = 0;
         pet_outward = 0;
         servos_cliff_position();
+        servo_note_target(servo_target_ticks, now);
         return;
     }
 
@@ -825,12 +1012,14 @@ static void servos_update(action_t action, touch_state_t touch,
             servo_target_ticks = pet_outward ?
                 SERVO_PET_TICKS : SERVO_HOME_TICKS;
         }
+        servo_note_target(servo_target_ticks, now);
         return;
     }
 
     petting = 0;
     pet_outward = 0;
     servos_home();
+    servo_note_target(servo_target_ticks, now);
 }
 
 /* -------------------------- HC-SR04 sensor --------------------------- */
@@ -1180,6 +1369,9 @@ static robot_state_t robot_state = STATE_STARTUP;
 static uint16_t state_since = 0, state_duration = 0;
 static uint8_t turn_left = 0;
 static uint8_t avoidance_blocked = 0;
+static uint8_t cliff_backup_attempts = 0u;  /* Capped by CLIFF_BACKUP_MAX_ATTEMPTS. */
+static uint8_t cliff_turn_needed = 0u;      /* Set by cliff_backup_start(). */
+static uint8_t cliff_turn_left = 0u;        /* Direction for STATE_CLIFF_TURN. */
 static touch_state_t previous_touch = TOUCH_NONE;
 static uint8_t startle_was_turning = 0;
 static uint16_t startle_turn_since = 0;
@@ -1189,11 +1381,67 @@ static uint16_t startle_turn_since = 0;
 static uint8_t dizzy_overlay = 0u;
 static uint16_t dizzy_overlay_since = 0u;
 
+/* Picks the STATE_CLIFF_BACKUP move from whichever front sensor(s) are
+ * latched right now (the robot is already braked/stationary at this point,
+ * so the live reading reflects the real edge). It always reverses (moving
+ * the front away from the edge), but ROTATES while doing so when only one
+ * side tripped: that side's wheel runs at the slower
+ * CLIFF_BACKUP_TURN_SPEED while the opposite wheel runs at the full
+ * CLIFF_BACKUP_SPEED, so the robot pivots away from that corner as it backs
+ * up instead of retreating straight into the same edge. If both sensors
+ * trip together, that's the original straight-line case: both wheels get
+ * CLIFF_BACKUP_SPEED, no turn bias, same as before this change. Also
+ * records cliff_turn_needed/cliff_turn_left for the STATE_CLIFF_TURN
+ * heading correction that follows once the edge is confirmed clear (see the
+ * comment on STATE_CLIFF_TURN's case in robot_enter() below). Sets
+ * cliff_backup_authorized itself. */
+static void cliff_backup_start(void)
+{
+    uint8_t mask = ir_cliff_mask();
+    uint8_t left  = (mask & CLIFF_BIT_FL) != 0u;
+    uint8_t right = (mask & CLIFF_BIT_FR) != 0u;
+    uint8_t left_speed, right_speed;
+
+    if (!left && !right) {
+        /* Shouldn't happen (cliff_latched implies a mask bit), but stay
+         * safe if it ever does. */
+        cliff_backup_authorized = 0u;
+        cliff_turn_needed = 0u;
+        motors_set_targets(0, 0);
+        return;
+    }
+
+    if (left && right) {
+        left_speed = right_speed = CLIFF_BACKUP_SPEED;      /* Straight. */
+        cliff_turn_needed = 0u;      /* No side to prefer; no bias needed. */
+    } else if (left) {
+        left_speed = CLIFF_BACKUP_TURN_SPEED;   /* Cliff side: slower. */
+        right_speed = CLIFF_BACKUP_SPEED;       /* Far side: full speed. */
+        cliff_turn_needed = 1u;
+        cliff_turn_left = 0u;                   /* Turn away from the left. */
+    } else {
+        left_speed = CLIFF_BACKUP_SPEED;
+        right_speed = CLIFF_BACKUP_TURN_SPEED;
+        cliff_turn_needed = 1u;
+        cliff_turn_left = 1u;                   /* Turn away from the right. */
+    }
+
+    cliff_backup_authorized = 1u;
+    if (MOTOR_A_IS_LEFT) {
+        motors_set_targets_reverse(left_speed, right_speed);
+    } else {
+        motors_set_targets_reverse(right_speed, left_speed);
+    }
+}
+
 static void robot_enter(robot_state_t state, uint16_t now)
 {
     if (state == robot_state) {
         return;
     }
+    /* Default off on every transition; only the STATE_CLIFF_BACKUP case
+     * below re-arms it, so the exception can never leak into another state. */
+    cliff_backup_authorized = 0u;
     robot_state = state;
     state_since = now;
     state_duration = 0;
@@ -1224,6 +1472,42 @@ static void robot_enter(robot_state_t state, uint16_t now)
         state_duration = SETTLE_TICKS;
         motors_set_targets(0, 0);
         break;
+    case STATE_CLIFF_BACKUP: {
+        /* The one deliberate exception to "cliff_latched always brakes":
+         * authorize a short, modest move -- direction and turn bias chosen
+         * by cliff_backup_start() from which corner(s) are latched -- so the
+         * sensor gets a chance to move clear of the edge instead of sitting
+         * there forever. Bounded strictly by state_duration below,
+         * regardless of what the sensor reads meanwhile. Grows a bit on
+         * each retry (cliff_backup_attempts is already incremented by the
+         * caller before this runs): a corner the first modest backup
+         * didn't clear gets more room next time instead of repeating an
+         * identical move that will just fail the same way again. */
+        uint16_t grown = CLIFF_BACKUP_TICKS + (uint16_t)
+            ((cliff_backup_attempts > 1u ? cliff_backup_attempts - 1u : 0u) *
+             CLIFF_BACKUP_TICKS_GROWTH);
+        state_duration = grown > CLIFF_BACKUP_TICKS_MAX ?
+            CLIFF_BACKUP_TICKS_MAX : grown;
+        cliff_backup_start();
+        break;
+    }
+    case STATE_CLIFF_TURN: {
+        /* Runs only once cliff_release_if_safe() has confirmed the surface
+         * clear for the full IR_SURFACE_STABLE_TICKS window, so it's safe
+         * to move forward again -- and if either sensor trips again mid-turn
+         * the usual ISR-level brake (independent of robot_state) still
+         * catches it immediately, same as any other state. A short, bounded
+         * arc turn away from whichever side originally tripped, so cruising
+         * resumes pointed away from that edge instead of straight back
+         * toward it. cliff_backup_start() decided cliff_turn_needed/
+         * cliff_turn_left; robot_update() skips straight to STATE_SETTLE
+         * instead when both sensors tripped together (no side to prefer). */
+        uint8_t a_is_inner = (cliff_turn_left == MOTOR_A_IS_LEFT);
+        state_duration = CLIFF_TURN_TICKS;
+        motors_set_targets(a_is_inner ? TURN_SLOW_PWM : TURN_FAST_PWM,
+                           a_is_inner ? TURN_FAST_PWM : TURN_SLOW_PWM);
+        break;
+    }
     case STATE_STARTLED:
         state_duration = STARTLE_PAUSE_TICKS;
         motors_set_targets(0, 0);
@@ -1245,6 +1529,8 @@ static void robot_begin(uint16_t now)
     state_duration = STARTUP_TICKS;
     previous_touch = TOUCH_NONE;
     avoidance_blocked = 0;
+    cliff_backup_attempts = 0u;
+    cliff_turn_needed = 0u;
     motors_set_targets(0, 0);
 }
 
@@ -1315,17 +1601,37 @@ static void robot_update(uint16_t now, touch_state_t touch)
 
     /* Highest priority, also serviced independently by Timer2. */
     if (cliff_latched) {
-        if (robot_state != STATE_CLIFF) {
+        if (robot_state == STATE_CLIFF_BACKUP) {
+            /* A bounded reverse is already under way; its own timeout in
+             * the switch below decides when it ends. Don't reroute here. */
+        } else if (robot_state != STATE_CLIFF) {
             robot_enter(STATE_CLIFF, now);
             return;
-        }
-        if (surface_stable_ticks < IR_SURFACE_STABLE_TICKS) {
+        } else if (surface_stable_ticks < IR_SURFACE_STABLE_TICKS) {
+            /* A genuinely stationary cliff will never self-clear while the
+             * robot sits still -- the sensor keeps reading the same drop
+             * forever. After a short confirm delay (so a one-sample glitch
+             * can clear on its own without moving), back away a small,
+             * bounded amount and check again. Give up after a few tries
+             * rather than shuffle back and forth indefinitely, same
+             * philosophy as STATE_BLOCKED below. */
+            if (cliff_backup_attempts < CLIFF_BACKUP_MAX_ATTEMPTS &&
+                (uint16_t)(now - state_since) >= CLIFF_CONFIRM_TICKS) {
+                ++cliff_backup_attempts;
+                robot_enter(STATE_CLIFF_BACKUP, now);
+            }
             return;
-        }
-        if (!cliff_release_if_safe()) {
+        } else if (!cliff_release_if_safe()) {
             return;
+        } else {
+            cliff_backup_attempts = 0u;
+            if (cliff_turn_needed) {
+                cliff_turn_needed = 0u;
+                robot_enter(STATE_CLIFF_TURN, now);
+            } else {
+                robot_enter(STATE_SETTLE, now);
+            }
         }
-        robot_enter(STATE_SETTLE, now);
     }
 
     if (touch != TOUCH_NONE) {
@@ -1396,6 +1702,20 @@ static void robot_update(uint16_t now, touch_state_t touch)
     case STATE_PETTING:
     case STATE_SENSOR_WAIT:
         robot_enter(STATE_SETTLE, now);
+        break;
+    case STATE_CLIFF_BACKUP:
+        if (elapsed >= state_duration) {
+            /* Stop and hand back to the block above on the next pass: if
+             * the sensor is finally clear (and has been for the full
+             * stable window) the latch releases there; otherwise it
+             * retries, up to the attempt cap, or simply stays braked. */
+            robot_enter(STATE_CLIFF, now);
+        }
+        break;
+    case STATE_CLIFF_TURN:
+        if (elapsed >= state_duration) {
+            robot_enter(STATE_SETTLE, now);
+        }
         break;
     case STATE_BLOCKED:
         /* No blind retries or reversing. Wait for space or repositioning. */

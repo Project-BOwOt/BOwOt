@@ -1,32 +1,162 @@
+#include <stdint.h>
+#include <assert.h>
+#include <stdio.h>
+#define OCF2 7
+#define PD3 3
+#define CS01 1
+#define CS11 1
+#define CS21 1
+static volatile uint8_t PINA;
+static volatile uint8_t PINB;
+static volatile uint8_t PINC;
+static volatile uint8_t PIND;
+static volatile uint8_t TWSR;
+static volatile uint8_t OCR2;
+#define ADATE 5
+#define JTD 7
+#define TOV0 0
+#define TOV2 6
+static volatile uint16_t OCR1A;
+static volatile uint16_t OCR1B;
+static volatile uint8_t TWBR;
+static volatile uint8_t TWCR;
+static volatile uint8_t TWDR;
+#define TWEN 2
+static volatile uint8_t ADCH;
+#define ADEN 7
+#define ADIE 3
+#define ADIF 4
+#define ADTS0 5
+#define ADTS2 7
+static volatile uint8_t TCCR1A;
+static volatile uint8_t TCCR1B;
+#define TW_MT_SLA_ACK 0x18
+#define ADSC 6
+#define COM1A1 7
+#define COM1B1 5
+static volatile uint8_t ADMUX;
+static volatile uint8_t DDRA;
+static volatile uint8_t DDRB;
+static volatile uint8_t DDRC;
+static volatile uint8_t DDRD;
+#define TWSTA 5
+#define TWSTO 4
+static volatile uint8_t TIFR;
+static volatile uint8_t SREG;
+#define REFS0 6
+static volatile uint8_t PORTA;
+static volatile uint8_t PORTB;
+static volatile uint8_t PORTC;
+static volatile uint8_t PORTD;
+static volatile uint16_t ADC;
+#define ADTS1 6
+#define PB2 2
+#define TWINT 7
+#define AVR 1
+static volatile uint8_t SFIOR;
+#define PA0 0
+#define PA1 1
+#define PA2 2
+#define PA3 3
+#define PB0 0
+#define PB1 1
+#define PB3 3
+#define PB4 4
+#define PC0 0
+#define PC1 1
+#define PC3 3
+#define PC4 4
+#define PC5 5
+#define PC6 6
+#define PC7 7
+#define PD0 0
+#define PD1 1
+#define PD2 2
+#define PD5 5
+#define PD6 6
+#define WGM10 0
+#define WGM12 3
+#define TW_MT_DATA_ACK 0x28
+#define TOIE2 6
+static volatile uint8_t TIMSK;
+static volatile uint8_t ADCSRA;
+#define PD4 4
+#define OCIE2 7
+#define ADLAR 5
+#define ADPS2 2
+#define TW_START 0x08
+static volatile uint8_t TCCR0;
+static volatile uint8_t TCCR2;
+#define TW_REP_START 0x10
+static volatile uint8_t TCNT0;
+static volatile uint8_t TCNT2;
+
+#define _BV(n) (1u << (n))
+#define PROGMEM
+#define EEMEM
+#define PSTR(s) (s)
+#define pgm_read_byte(p) (*(const uint8_t *)(p))
+#define cli() ((void)0)
+#define sei() ((void)0)
+#define ISR(v) void v(void)
+#define _delay_us(t) ((void)(t))
+#define _delay_ms(t) ((void)(t))
+static volatile uint8_t MCUCSR;
+static uint16_t eeprom_read_word(const uint16_t *p) { return *p; }
+static unsigned eeprom_writes;
+static void eeprom_update_word(uint16_t *p, uint16_t v) {
+    if (*p != v) { *p = v; ++eeprom_writes; }
+}
+#define main firmware_main
+
 /*
  * Robot firmware: RoboEyes-inspired C expressions, working microphone and FSM.
  * ATmega32, actual CPU clock 1 MHz; defining F_CPU does not set fuse bits.
  * Existing wiring is unchanged; add MAX9814 OUT to PA2/ADC2 (DIP pin 38):
  *   L298N ENA PD5, ENB PD4; IN1 PD2, IN2 PD3, IN3 PD6, IN4 PD1.
- *   IR OUT PB0 (LOW = cliff, HIGH = surface); SG90 PB1; SG92 PB2.
+ *   IR OUT PB0 (polarity: IR_CLIFF_LEVEL); SG90 PB1; SG92 PB2.
  *   HC-SR04 TRIG PB3 / ECHO PD0; OLED SCL PC0 / SDA PC1.
  *   TTP223 left PA0 / right PA1; SW-18015P DO PC3; AVCC powered; all grounds common.
  *   MAX9814 VDD=regulated 5V, GND=common, OUT=PA2, GAIN=VDD, A/R=GND.
  *   AVCC pin 30=5V; AREF pin 32=100nF to GND (no external voltage).
  *   Never wire AREF directly to GND. AVCC is required even with MIC_ENABLED=0.
- * Remove L298N ENA/ENB jumpers. No automatic reverse is used.
+ * Remove L298N ENA/ENB jumpers. The only automatic reverse is a short,
+ * capped backup away from a latched cliff (STATE_CLIFF_BACKUP below);
+ * every other state still only ever drives forward.
  *
  * ADDED (all on free PORTC pins; JTAG is already disabled by shock_init()):
  *   KY-040 CLK PC4, DT PC5, SW PC6 (+ to 5V, GND common).
  *   DHT11 DATA PC7 (needs a 4.7-10 k pull-up to 5V; 3-pin modules have one).
  *   KY-040: turn = pick a mode, push = select (or exit Weather Mode).
- *   Modes: ROAM (the unchanged autonomous FSM) and WEATHER (stationary).
+ *   WEATHER, POMODORO and GAME are stationary.
+ *
+ * Front cliff sensors: left PB0, right PB4; polarity is IR_CLIFF_LEVEL.
+ * Cliff recovery: longer straight reverse, confirm floor, then randomly
+ * turn left/right approximately 90 degrees. Tune CLIFF_TURN_TICKS on the
+ * actual chassis: there is no wheel encoder/gyro to measure an exact angle.
+ *
+ * NEW: active buzzer control PA3 (40-pin DIP pin 37), active HIGH.
+ * Use a transistor driver for a bare buzzer; see robot19_notes.md.
+ * Modes: ROAM, WEATHER, POMODORO, GAME. Existing sensor wiring is unchanged.
+ * Pomodoro: turn to set minutes, push; set seconds, push to start.
+ * Push while running/done returns to the mode menu and silences the buzzer.
+ * Game: CATCH BALLS, FIND YOUR TIMING, HIGH SCORES, BACK. Push selects/back.
+ * Catch: turn to move paddle; three misses end a round. Push exits a round.
+ * Timing: release both pads, push to start; after 5 seconds a beep signals
+ * touch either pad. Early touches invalidate the round. Push returns.
+ * Best catch score and fastest valid reaction persist in EEPROM.
  *
  * Build (avr-gcc/avr-libc installed):
  * avr-gcc -mmcu=atmega32 -std=gnu99 -Os -Wall -Wextra -Werror \
- *   robot_sh1106.c -o robot_fsm.elf
+ *   robot19.c -o robot_fsm.elf
  * avr-objcopy -O ihex -R .eeprom robot_fsm.elf robot_fsm.hex
  * avr-size -C --mcu=atmega32 robot_fsm.elf
  *
  * Test with wheels raised, then at floor level with a tether/catch surface.
  * PWM duty is NOT measured wheel speed. Tune to the actual loaded robot.
- * Braking is not zero stopping distance; a single IR sensor cannot protect
- * both wheel paths during a turn or distinguish all dark floors from cliffs.
+ * Braking is not zero stopping distance; two front IR sensors still cannot
+ * protect the wheel paths mid-turn or distinguish every dark floor from a
+ * real cliff. Calibrate the turn on the actual surface, away from an edge.
  * L298 braking current must remain within the driver's/motor's limits.
  */
 #ifndef F_CPU
@@ -36,11 +166,6 @@
 //#error "Timer constants in this firmware require an actual 1 MHz CPU clock"
 #endif
 
-#include <avr/io.h>
-#include <avr/interrupt.h>
-#include <avr/pgmspace.h>
-#include <util/delay.h>
-#include <util/twi.h>
 #include <stdint.h>
 
 /* --------------------------- User settings --------------------------- */
@@ -61,7 +186,20 @@
 #ifndef IR_CLIFF_LEVEL
 #define IR_CLIFF_LEVEL                1u   /* 0: LOW=cliff; 1: HIGH=cliff. */
 #endif
+/* One corner sensor per PORTB pin; see the wiring comment at the top. */
+#define IR_FL_PIN                    PB0   /* Front-left  (original sensor). */
+#define IR_FR_PIN                    PB4   /* Front-right. */
 #define IR_SURFACE_STABLE_TICKS     150u   /* 307 ms before cliff recovery. */
+#define CLIFF_CONFIRM_TICKS          90u   /* ~184 ms braked before backing up;
+                                             * lets a one-sample glitch clear
+                                             * on its own without moving. */
+#define CLIFF_BACKUP_SPEED            60u  /* Equal wheel speeds: straight back. */
+#define CLIFF_BACKUP_TICKS           400u  /* ~819 ms, formerly ~410 ms. */
+#define CLIFF_BACKUP_TICKS_GROWTH     70u
+#define CLIFF_BACKUP_TICKS_MAX       680u  /* ~1.39 s maximum per attempt. */
+#define CLIFF_BACKUP_MAX_ATTEMPTS      5u
+#define CLIFF_TURN_PWM               110u  /* Outer wheel; inner wheel stopped. */
+#define CLIFF_TURN_TICKS             440u  /* ~901 ms: CALIBRATE for 90 degrees. */
 #define SETTLE_TICKS                170u   /* 348 ms before resuming. */
 #define TURN_TIMEOUT_TICKS         1953u   /* About 4 s, then brake/wait. */
 #define STARTUP_TICKS               250u
@@ -90,12 +228,22 @@
 #define STARTLE_PAUSE_TICKS         240u   /* 491.5 ms; no blocking delay. */
 #define DIZZY_PAUSE_TICKS           500u   /* About 1.02 s of dizziness. */
 #define SHOCK_ACTIVE_LOW              1u   /* Common modules: DO LOW on shock. */
-#define SHOCK_REARM_TICKS            25u   /* About 51 ms quiet before re-arm. */
+#define SHOCK_REARM_TICKS             10u  /* About 20 ms quiet before re-arm:
+                                             * the sensitivity/responsiveness
+                                             * knob -- see the comment above
+                                             * shock_sample_isr() below. */
 
 #define SERVO_HOME_TICKS             125u  /* 1.000 ms at 8 us/tick */
 #define SERVO_CLIFF_TICKS            188u  /* 1.504 ms: about 90 degrees */
 #define SERVO_PET_TICKS              145u  /* 1.160 ms: gentle petting wiggle */
 #define SERVO_PET_HALF_PERIOD_TICKS  120u  /* About 246 ms each way. */
+#define SERVO_ACTIVE_HOLD_TICKS      200u  /* ~410 ms of pulses after any
+                                             * target change -- enough for a
+                                             * full sweep plus settle -- then
+                                             * pulses stop until the next
+                                             * change, so the servos aren't
+                                             * driven/buzzing while just
+                                             * holding a steady position. */
 
 #define SH1106_COLUMN_OFFSET         2u
 #define OLED_EYE_X                   24u
@@ -168,6 +316,9 @@
 #if IR_CLIFF_LEVEL != 0 && IR_CLIFF_LEVEL != 1
 #error "IR_CLIFF_LEVEL must be 0 or 1"
 #endif
+#if CLIFF_BACKUP_TICKS_MAX < CLIFF_BACKUP_TICKS
+#error "CLIFF_BACKUP_TICKS_MAX must be >= CLIFF_BACKUP_TICKS"
+#endif
 #if MIC_MIN_P2P < 1 || MIC_MIN_P2P > 255 || MIC_RISE_P2P < 2 || \
     MIC_RISE_P2P > 127 || MIC_REARM_WINDOWS < 1 || MIC_REARM_WINDOWS > 255
 #error "Use valid 8-bit microphone thresholds and a nonzero re-arm count"
@@ -214,6 +365,8 @@ typedef enum {
     STATE_SETTLE,
     STATE_PETTING,
     STATE_CLIFF,
+    STATE_CLIFF_BACKUP,     /* Bounded reverse away from a latched cliff. */
+    STATE_CLIFF_TURN,       /* Random calibrated quarter turn after retreat. */
     STATE_BLOCKED,
     STATE_SENSOR_WAIT,
     STATE_STARTLED,
@@ -222,7 +375,9 @@ typedef enum {
 
 /* User-selectable operating modes (KY-040).  MODE_ROAM is the complete,
  * unchanged autonomous behavior implemented by the FSM below. */
-typedef enum { MODE_ROAM, MODE_WEATHER, MODE_COUNT } robot_mode_t;
+typedef enum {
+    MODE_ROAM, MODE_WEATHER, MODE_POMODORO, MODE_GAME, MODE_COUNT
+} robot_mode_t;
 
 typedef enum {
     WX_NONE, WX_COMFORTABLE, WX_HOT, WX_COLD, WX_HUMID, WX_DRY
@@ -237,11 +392,47 @@ static uint8_t ui_dirty = 0u;
 
 static volatile uint8_t cliff_latched = 1u;
 static volatile uint8_t surface_stable_ticks = 0u;
+/* Normally ANY cliff reading forces an immediate brake, no exceptions -- see
+ * the ISR and motors_service() below. This flag is the one deliberate,
+ * tightly-scoped carve-out: while STATE_CLIFF_BACKUP has it set, a bounded
+ * reverse move is allowed to run despite cliff_latched being true, so the
+ * robot can back away from an edge it would otherwise sit at forever (the
+ * sensor never clears on its own if the robot never moves). robot_enter()
+ * is the only place that sets or clears it, and it defaults to 0 on every
+ * single state change, so it can never stay "on" outside that one state. */
+static volatile uint8_t cliff_backup_authorized = 0u;
 
-/* All four safety checks use this same polarity, including the Timer2 ISR. */
+/* Bit assignment for the 2-sensor cliff bitmask returned by ir_cliff_mask().
+ * Used only to pick a backup direction; every safety latch/brake path below
+ * still treats "either sensor" the same as the original single-sensor code. */
+#define CLIFF_BIT_FL                  _BV(0)
+#define CLIFF_BIT_FR                  _BV(1)
+
+/* Reads both front corner sensors and returns which one(s) currently see a
+ * cliff, using the same IR_CLIFF_LEVEL polarity as the original sensor.
+ * Single register read (PINB), so this is safe to call from the ISR or
+ * from the main loop without disabling interrupts, exactly like the old
+ * single-pin ir_cliff_now() it replaces here. */
+static inline uint8_t ir_cliff_mask(void)
+{
+    uint8_t m = 0u;
+    if (((PINB & _BV(IR_FL_PIN)) ? 1u : 0u) == IR_CLIFF_LEVEL) {
+        m |= CLIFF_BIT_FL;
+    }
+    if (((PINB & _BV(IR_FR_PIN)) ? 1u : 0u) == IR_CLIFF_LEVEL) {
+        m |= CLIFF_BIT_FR;
+    }
+    return m;
+}
+
+/* Both safety checks use this same polarity, including the Timer2 ISR.
+ * Preserved name/signature: true the instant EITHER sensor sees a cliff,
+ * same as the original single-sensor behavior, so every existing call site
+ * (ISR latch, motors_service() brake gate, cliff_release_if_safe(), the
+ * STARTUP check) stays correct with no changes of its own. */
 static inline uint8_t ir_cliff_now(void)
 {
-    return ((PINB & _BV(PB0)) ? 1u : 0u) == IR_CLIFF_LEVEL;
+    return ir_cliff_mask() != 0u;
 }
 
 /* ------------------------------- Motors ------------------------------ */
@@ -259,9 +450,15 @@ static volatile motor_hw_mode_t motor_hw_mode = MOTOR_BRAKED;
 static uint8_t motor_target_a = 0, motor_target_b = 0;
 static uint8_t motor_current_a = 0, motor_current_b = 0;
 static uint16_t motor_arm_since = 0, motor_last_ramp = 0;
+/* Direction latched at the ARMING -> RUNNING transition below. 0 = forward
+ * (the only direction this firmware used to drive), 1 = reverse. Only
+ * motors_set_targets_reverse() (the cliff-backup maneuver) ever sets this. */
+static volatile uint8_t motor_reverse = 0u;
 
 #define MOTOR_DIRECTION_MASK (_BV(PD1) | _BV(PD2) | _BV(PD3) | _BV(PD6))
 #define MOTOR_ENABLE_MASK (_BV(PD4) | _BV(PD5))
+#define MOTOR_FORWARD_BITS (_BV(PD2) | _BV(PD1))   /* IN1 + IN4 high. */
+#define MOTOR_REVERSE_BITS (_BV(PD3) | _BV(PD6))   /* IN2 + IN3 high. */
 
 /* Caller has interrupts disabled (main atomic section or ISR). */
 static inline void motors_brake_now(void)
@@ -298,6 +495,19 @@ static void motors_init(void)
 
 static void motors_set_targets(uint8_t speed_a, uint8_t speed_b)
 {
+    motor_reverse = 0u;
+    motor_target_a = speed_a;
+    motor_target_b = speed_b;
+    if (!speed_a && !speed_b) {
+        motors_brake();
+    }
+}
+
+/* Used only by the bounded STATE_CLIFF_BACKUP maneuver below -- everywhere
+ * else in the firmware still only ever drives forward, unchanged. */
+static void motors_set_targets_reverse(uint8_t speed_a, uint8_t speed_b)
+{
+    motor_reverse = 1u;
     motor_target_a = speed_a;
     motor_target_b = speed_b;
     if (!speed_a && !speed_b) {
@@ -336,12 +546,14 @@ static void motors_service(uint16_t now)
     uint8_t saved_sreg = SREG;
     cli();
 
-    /* Never let a stale main-loop command undo an interrupt's cliff stop. */
+    /* Never let a stale main-loop command undo an interrupt's cliff stop.
+     * cliff_backup_authorized is the one deliberate, bounded exception: it
+     * lets STATE_CLIFF_BACKUP's reverse move run despite cliff_latched. */
     if (ir_cliff_now()) {
         cliff_latched = 1u;
         surface_stable_ticks = 0u;
     }
-    if (cliff_latched ||
+    if ((cliff_latched && !cliff_backup_authorized) ||
         (!motor_target_a && !motor_target_b)) {
         motors_brake_now();
         motor_current_a = motor_current_b = 0;
@@ -362,7 +574,8 @@ static void motors_service(uint16_t now)
     } else if (motor_hw_mode == MOTOR_ARMING) {
         if ((uint16_t)(now - motor_arm_since) >= MOTOR_PWM_ARM_TICKS) {
             PORTD = (uint8_t)((PORTD & (uint8_t)~MOTOR_DIRECTION_MASK) |
-                             _BV(PD2) | _BV(PD1));
+                             (motor_reverse ? MOTOR_REVERSE_BITS
+                                            : MOTOR_FORWARD_BITS));
             motor_hw_mode = MOTOR_RUNNING;
             motor_last_ramp = now;
         }
@@ -376,13 +589,14 @@ static void motors_service(uint16_t now)
     SREG = saved_sreg;
 }
 
-/* -------------------------- Cliff IR sensor -------------------------- */
-/* PB0 polarity is selected only by IR_CLIFF_LEVEL above. */
+/* ------------------------ Cliff IR sensors (x2) ----------------------- */
+/* Polarity for both front corners is selected only by IR_CLIFF_LEVEL above. */
 
 static void ir_init(void)
 {
-    DDRB &= (uint8_t)~_BV(PB0);
-    PORTB |= _BV(PB0);                 /* Retain the existing input pull-up. */
+    DDRB &= (uint8_t)~(_BV(IR_FL_PIN) | _BV(IR_FR_PIN));
+    PORTB |= _BV(IR_FL_PIN) | _BV(IR_FR_PIN); /* Same pull-up convention as
+                                                * the original PB0 sensor. */
 }
 
 /* --------------------------- Two servos ------------------------------ */
@@ -395,6 +609,85 @@ static volatile uint16_t system_ticks_2ms = 0;
 
 static inline void shock_sample_isr(void);
 static inline void encoder_sample_isr(void);
+static inline void activities_tick_isr(void);
+
+#define BUZZER_PIN PA3
+#define BUZZER_ACTIVE_HIGH 1u /* Set 0 for an active-LOW three-pin module. */
+#define REACTION_COUNTDOWN_TICKS 2442u /* ceil(5 s / 2.048 ms). */
+#define REACTION_TIMEOUT_TICKS 4883u   /* 10 seconds after the cue. */
+enum { RX_OFF, RX_COUNTDOWN, RX_WAIT, RX_HIT, RX_EARLY, RX_TIMEOUT };
+static volatile uint8_t rx_phase = RX_OFF;
+static volatile uint16_t rx_started = 0u, rx_hit_tick = 0u;
+static uint16_t rx_candidate_tick = 0u;
+static uint8_t rx_touch_count = 0u;
+static volatile uint16_t buzzer_ticks = 0u;
+
+static inline void buzzer_output(uint8_t on)
+{
+    if (on == BUZZER_ACTIVE_HIGH) PORTA |= _BV(BUZZER_PIN);
+    else PORTA &= (uint8_t)~_BV(BUZZER_PIN);
+}
+
+static void buzzer_beep(uint16_t ticks)
+{
+    uint8_t saved = SREG;
+    cli();
+    buzzer_ticks = ticks;
+    buzzer_output(ticks != 0u);
+    SREG = saved;
+}
+
+static void buzzer_init(void)
+{
+    buzzer_output(0u);
+    DDRA |= _BV(BUZZER_PIN);
+}
+
+static inline void activities_tick_isr(void)
+{
+    uint8_t touched;
+    if (buzzer_ticks && --buzzer_ticks == 0u) buzzer_output(0u);
+    if (rx_phase != RX_COUNTDOWN && rx_phase != RX_WAIT) return;
+    touched = PINA & (_BV(PA0) | _BV(PA1));
+#if !TOUCH_ACTIVE_HIGH
+    touched = (uint8_t)(~touched) & (_BV(PA0) | _BV(PA1));
+#endif
+    if (rx_phase == RX_COUNTDOWN) {
+        /* Held pads/early touches must never become a zero-ms high score. */
+        if (touched) {
+            rx_phase = RX_EARLY;
+        } else if ((uint16_t)(system_ticks_2ms - rx_started) >=
+                   REACTION_COUNTDOWN_TICKS) {
+            rx_started = system_ticks_2ms;
+            rx_touch_count = 0u;
+            buzzer_ticks = 60u;
+            buzzer_output(1u);
+            rx_phase = RX_WAIT;
+        }
+    } else if ((uint16_t)(system_ticks_2ms - rx_started) >=
+               REACTION_TIMEOUT_TICKS) {
+        rx_phase = RX_TIMEOUT;
+    } else if (touched) {
+        if (rx_touch_count == 0u) rx_candidate_tick = system_ticks_2ms;
+        if (++rx_touch_count > TOUCH_DEBOUNCE_TICKS) {
+            rx_hit_tick = rx_candidate_tick;
+            rx_phase = RX_HIT;
+        }
+    } else {
+        rx_touch_count = 0u;
+    }
+}
+
+static volatile uint8_t servo_pulses_enabled = 1u; /* See servo_note_target()
+                                                     * below: pulses only run
+                                                     * for a bit after the
+                                                     * target actually
+                                                     * changes, then stop, so
+                                                     * the servos aren't
+                                                     * continuously driven
+                                                     * (and buzzing) at rest. */
+static uint8_t servo_last_seen_ticks = SERVO_HOME_TICKS;
+static uint16_t servo_change_tick = 0;
 
 static void servos_init(void)
 {
@@ -418,9 +711,28 @@ static void servos_cliff_position(void)
     servo_target_ticks = SERVO_CLIFF_TICKS;
 }
 
+/* Call once per servos_update() pass with whatever servo_target_ticks was
+ * just (re)requested. A real change (re)starts the SERVO_ACTIVE_HOLD_TICKS
+ * hold window and turns pulses back on; once that window elapses with no
+ * further change, pulses turn off until the next one. Only this function
+ * and the two ISRs below touch servo_pulses_enabled. Main-loop only (not
+ * ISR-safe), same as the rest of servos_update(). */
+static void servo_note_target(uint8_t target, uint16_t now)
+{
+    if (target != servo_last_seen_ticks) {
+        servo_last_seen_ticks = target;
+        servo_change_tick = now;
+        servo_pulses_enabled = 1u;
+    } else if (servo_pulses_enabled &&
+               (uint16_t)(now - servo_change_tick) >= SERVO_ACTIVE_HOLD_TICKS) {
+        servo_pulses_enabled = 0u;
+    }
+}
+
 ISR(TIMER2_OVF_vect)
 {
     ++system_ticks_2ms;
+    activities_tick_isr();
     shock_sample_isr();
     encoder_sample_isr();
 
@@ -430,18 +742,23 @@ ISR(TIMER2_OVF_vect)
     if (ir_cliff_now()) {
         cliff_latched = 1u;
         surface_stable_ticks = 0u;
-        if (motor_hw_mode != MOTOR_BRAKED) {
+        if (!cliff_backup_authorized && motor_hw_mode != MOTOR_BRAKED) {
             motors_brake_now();
         }
     } else if (surface_stable_ticks < IR_SURFACE_STABLE_TICKS) {
         ++surface_stable_ticks;
     }
 
+    /* servo_frame_count itself always keeps counting (DHT11 timing below
+     * relies on this same frame cadence); only the actual pulse output is
+     * gated by servo_pulses_enabled. */
     if (++servo_frame_count >= 10u) {
         servo_frame_count = 0;
-        OCR2 = servo_target_ticks;
-        PORTB |= _BV(PB1) | _BV(PB2);
-        servo_pulse_active = 1;
+        if (servo_pulses_enabled) {
+            OCR2 = servo_target_ticks;
+            PORTB |= _BV(PB1) | _BV(PB2);
+            servo_pulse_active = 1;
+        }
     }
 }
 
@@ -590,7 +907,21 @@ static void microphone_service(uint16_t now)
 /* The common SW-18015P comparator module presents a digital DO signal and
  * typically goes LOW on vibration. PC3 is currently unused in this robot.
  * We sample it from the existing ~2.048 ms Timer2 ISR so a short shock pulse
- * is not lost while OLED/sonar code is running in the main loop. */
+ * is not lost while OLED/sonar code is running in the main loop.
+ *
+ * SENSITIVITY: shock_sample_isr() below already reacts on the very FIRST
+ * ~2.048 ms sample where DO reads active -- that's as fast as this firmware
+ * can possibly notice a shock, so there is no software "threshold" to lower
+ * for a single shake. The one sensitivity-related knob in code is
+ * SHOCK_REARM_TICKS above: it's how long DO must read quiet again before the
+ * NEXT shake is allowed to register, so lowering it (already done above)
+ * makes repeated/ongoing shaking register more readily. If a single firm
+ * shake still needs to be hard before anything happens, that threshold is
+ * set on the sensor module itself: most SW-18015P breakout boards have a
+ * small onboard trimmer potentiometer feeding the comparator's reference --
+ * turn it toward the more-sensitive direction (consult your specific
+ * board's silkscreen/markings) rather than looking for another macro here.
+ */
 static volatile uint8_t shock_event_pending = 0;
 static volatile uint8_t shock_armed = 1u;
 static volatile uint8_t shock_rearm_ticks = 0u;
@@ -807,6 +1138,7 @@ static void servos_update(action_t action, touch_state_t touch,
         petting = 0;
         pet_outward = 0;
         servos_cliff_position();
+        servo_note_target(servo_target_ticks, now);
         return;
     }
 
@@ -825,12 +1157,14 @@ static void servos_update(action_t action, touch_state_t touch,
             servo_target_ticks = pet_outward ?
                 SERVO_PET_TICKS : SERVO_HOME_TICKS;
         }
+        servo_note_target(servo_target_ticks, now);
         return;
     }
 
     petting = 0;
     pet_outward = 0;
     servos_home();
+    servo_note_target(servo_target_ticks, now);
 }
 
 /* -------------------------- HC-SR04 sensor --------------------------- */
@@ -1180,6 +1514,9 @@ static robot_state_t robot_state = STATE_STARTUP;
 static uint16_t state_since = 0, state_duration = 0;
 static uint8_t turn_left = 0;
 static uint8_t avoidance_blocked = 0;
+static uint8_t cliff_backup_attempts = 0u;  /* Capped by CLIFF_BACKUP_MAX_ATTEMPTS. */
+static uint8_t cliff_turn_needed = 0u;      /* Set by cliff_backup_start(). */
+static uint8_t cliff_turn_left = 0u;        /* Direction for STATE_CLIFF_TURN. */
 static touch_state_t previous_touch = TOUCH_NONE;
 static uint8_t startle_was_turning = 0;
 static uint16_t startle_turn_since = 0;
@@ -1189,11 +1526,31 @@ static uint16_t startle_turn_since = 0;
 static uint8_t dizzy_overlay = 0u;
 static uint16_t dizzy_overlay_since = 0u;
 
+/* Finish the full straight retreat before releasing the cliff latch.
+ * Pick one random direction per recovery, including a BOTH-sensor cliff. */
+static void cliff_backup_start(void)
+{
+    if (!ir_cliff_now()) {
+        cliff_backup_authorized = 0u;
+        motors_set_targets(0, 0);
+        return;
+    }
+    if (!cliff_turn_needed) {
+        cliff_turn_left = (uint8_t)(random_next() & 1u);
+        cliff_turn_needed = 1u;
+    }
+    cliff_backup_authorized = 1u;
+    motors_set_targets_reverse(CLIFF_BACKUP_SPEED, CLIFF_BACKUP_SPEED);
+}
+
 static void robot_enter(robot_state_t state, uint16_t now)
 {
     if (state == robot_state) {
         return;
     }
+    /* Default off on every transition; only the STATE_CLIFF_BACKUP case
+     * below re-arms it, so the exception can never leak into another state. */
+    cliff_backup_authorized = 0u;
     robot_state = state;
     state_since = now;
     state_duration = 0;
@@ -1224,6 +1581,25 @@ static void robot_enter(robot_state_t state, uint16_t now)
         state_duration = SETTLE_TICKS;
         motors_set_targets(0, 0);
         break;
+    case STATE_CLIFF_BACKUP: {
+        /* Bounded straight retreat, growing only if the floor stays absent. */
+        uint16_t grown = CLIFF_BACKUP_TICKS + (uint16_t)
+            ((cliff_backup_attempts > 1u ? cliff_backup_attempts - 1u : 0u) *
+             CLIFF_BACKUP_TICKS_GROWTH);
+        state_duration = grown > CLIFF_BACKUP_TICKS_MAX ?
+            CLIFF_BACKUP_TICKS_MAX : grown;
+        cliff_backup_start();
+        break;
+    }
+    case STATE_CLIFF_TURN: {
+        /* Floor must be stable before turning. Either sensor still brakes
+         * immediately if it detects another edge during this turn. */
+        uint8_t a_is_inner = (cliff_turn_left == MOTOR_A_IS_LEFT);
+        state_duration = CLIFF_TURN_TICKS;
+        motors_set_targets(a_is_inner ? 0u : CLIFF_TURN_PWM,
+                           a_is_inner ? CLIFF_TURN_PWM : 0u);
+        break;
+    }
     case STATE_STARTLED:
         state_duration = STARTLE_PAUSE_TICKS;
         motors_set_targets(0, 0);
@@ -1245,6 +1621,8 @@ static void robot_begin(uint16_t now)
     state_duration = STARTUP_TICKS;
     previous_touch = TOUCH_NONE;
     avoidance_blocked = 0;
+    cliff_backup_attempts = 0u;
+    cliff_turn_needed = 0u;
     motors_set_targets(0, 0);
 }
 
@@ -1286,13 +1664,13 @@ static void robot_update(uint16_t now, touch_state_t touch)
         dizzy_overlay = 0u;
     }
 
-    /* Weather Mode is stationary.  The motors were braked when it was entered
+    /* All non-ROAM modes are stationary. Motors are braked on entry
      * and no FSM state may retarget them, so the whole FSM (sonar, cliff,
      * touch and sound reactions) is suspended here.  The shock overlay above
      * is purely visual and still works.  Leaving the mode restarts the normal
      * STARTUP -> SETTLE -> CRUISE path through robot_begin(), which also
      * re-checks the cliff sensor before the wheels can move. */
-    if (robot_mode == MODE_WEATHER) {
+    if (robot_mode != MODE_ROAM) {
         return;
     }
 
@@ -1315,17 +1693,46 @@ static void robot_update(uint16_t now, touch_state_t touch)
 
     /* Highest priority, also serviced independently by Timer2. */
     if (cliff_latched) {
-        if (robot_state != STATE_CLIFF) {
+        if (robot_state == STATE_CLIFF_BACKUP) {
+            /* A bounded reverse is already under way; its own timeout in
+             * the switch below decides when it ends. Don't reroute here. */
+        } else if (robot_state != STATE_CLIFF) {
             robot_enter(STATE_CLIFF, now);
             return;
-        }
-        if (surface_stable_ticks < IR_SURFACE_STABLE_TICKS) {
+        } else if (surface_stable_ticks < IR_SURFACE_STABLE_TICKS) {
+            /* A genuinely stationary cliff will never self-clear while the
+             * robot sits still -- the sensor keeps reading the same drop
+             * forever. After a short confirm delay (so a one-sample glitch
+             * can clear on its own without moving), back away a small,
+             * bounded amount and check again. Give up after a few tries
+             * rather than shuffle back and forth indefinitely, same
+             * philosophy as STATE_BLOCKED below. */
+            if (touch == TOUCH_NONE &&
+                cliff_backup_attempts < CLIFF_BACKUP_MAX_ATTEMPTS &&
+                (uint16_t)(now - state_since) >= CLIFF_CONFIRM_TICKS) {
+                ++cliff_backup_attempts;
+                robot_enter(STATE_CLIFF_BACKUP, now);
+            }
             return;
-        }
-        if (!cliff_release_if_safe()) {
+        } else if (!cliff_release_if_safe()) {
             return;
+        } else {
+            cliff_backup_attempts = 0u;
+            if (cliff_turn_needed) {
+                cliff_turn_needed = 0u;
+                robot_enter(STATE_CLIFF_TURN, now);
+            } else {
+                robot_enter(STATE_SETTLE, now);
+            }
         }
-        robot_enter(STATE_SETTLE, now);
+    }
+
+    if (robot_state == STATE_CLIFF_BACKUP) {
+        if (touch != TOUCH_NONE ||
+            (uint16_t)(now - state_since) >= state_duration) {
+            robot_enter(STATE_CLIFF, now);
+        }
+        return;
     }
 
     if (touch != TOUCH_NONE) {
@@ -1397,6 +1804,20 @@ static void robot_update(uint16_t now, touch_state_t touch)
     case STATE_SENSOR_WAIT:
         robot_enter(STATE_SETTLE, now);
         break;
+    case STATE_CLIFF_BACKUP:
+        if (elapsed >= state_duration) {
+            /* Stop and hand back to the block above on the next pass: if
+             * the sensor is finally clear (and has been for the full
+             * stable window) the latch releases there; otherwise it
+             * retries, up to the attempt cap, or simply stays braked. */
+            robot_enter(STATE_CLIFF, now);
+        }
+        break;
+    case STATE_CLIFF_TURN:
+        if (elapsed >= state_duration) {
+            robot_enter(STATE_SETTLE, now);
+        }
+        break;
     case STATE_BLOCKED:
         /* No blind retries or reversing. Wait for space or repositioning. */
         if (!sonar_obstacle) {
@@ -1460,16 +1881,259 @@ static ui_state_t ui_state = UI_HIDDEN;
 static uint8_t ui_cursor = MODE_ROAM;
 static uint16_t ui_last_input = 0u;
 
+/* ---------------- Pomodoro and stationary games --------------------- */
+typedef enum { POMO_MINUTES, POMO_SECONDS, POMO_RUNNING, POMO_DONE } pomo_state_t;
+typedef enum {
+    GAME_MENU, GAME_CATCH, GAME_CATCH_OVER, GAME_TIMING_READY,
+    GAME_TIMING_ACTIVE, GAME_TIMING_RESULT, GAME_SCORES
+} game_state_t;
+static pomo_state_t pomo_state = POMO_MINUTES;
+static game_state_t game_state = GAME_MENU;
+static uint8_t pomo_minutes = 25u, pomo_seconds = 0u;
+static uint16_t pomo_remaining = 0u, pomo_total = 0u, activity_last_tick = 0u;
+static uint32_t pomo_fraction_us = 0UL;
+static uint16_t pomo_alarm_tick = 0u;
+static uint8_t game_cursor = 0u, game_lives = 3u, paddle_x = 55u;
+static uint16_t game_score = 0u, reaction_ms = 0u, reaction_score = 0u;
+static uint8_t reaction_result = RX_OFF, reaction_countdown = 5u;
+static uint16_t activity_rng = 0x716Bu;
+typedef struct { uint8_t x; int8_t y; } ball_t;
+static ball_t balls[3];
+
+/* Complements reject erased or interrupted EEPROM writes. Only improved
+ * records are written, from the stationary main loop, never from an ISR. */
+typedef struct { uint16_t value, inverse; } score_record_t;
+static score_record_t EEMEM ee_catch;
+static score_record_t EEMEM ee_reaction;
+static uint16_t best_catch = 0u, best_reaction_ms = 0u;
+
+static uint16_t score_load(const score_record_t *record)
+{
+    uint16_t value = eeprom_read_word(&record->value);
+    uint16_t inverse = eeprom_read_word(&record->inverse);
+    return (uint16_t)(value ^ inverse) == 0xFFFFu ? value : 0u;
+}
+
+static void score_store(score_record_t *record, uint16_t value)
+{
+    eeprom_update_word(&record->value, value);
+    eeprom_update_word(&record->inverse, (uint16_t)~value);
+}
+
+static uint16_t activity_random(void)
+{
+    activity_rng ^= (uint16_t)(activity_rng << 7);
+    activity_rng ^= (uint16_t)(activity_rng >> 9);
+    activity_rng ^= (uint16_t)(activity_rng << 8);
+    if (!activity_rng) activity_rng = 0x716Bu;
+    return activity_rng;
+}
+
+static uint8_t selection_wrap(uint8_t current, int8_t steps, uint8_t count)
+{
+    int16_t n = ((int16_t)current + steps) % count;
+    if (n < 0) n += count;
+    return (uint8_t)n;
+}
+
+static uint16_t timing_score(uint16_t ms)
+{
+    /* Strictly higher score for every lower millisecond, up to 10 seconds. */
+    return ms < 10000u ? (uint16_t)(10000u - ms) : 0u;
+}
+
+static void activity_stop(void)
+{
+    rx_phase = RX_OFF;
+    buzzer_beep(0u);
+}
+
+static void activity_begin(uint16_t now)
+{
+    activity_stop();
+    activity_rng ^= now;
+    activity_last_tick = now;
+    if (robot_mode == MODE_POMODORO) pomo_state = POMO_MINUTES;
+    else { game_state = GAME_MENU; game_cursor = 0u; }
+}
+
+static void activity_open_modes(uint16_t now)
+{
+    activity_stop();
+    ui_state = UI_MENU;
+    ui_cursor = (uint8_t)robot_mode;
+    ui_last_input = now;
+    ui_dirty |= UI_BAND_ALL;
+}
+
+static void catch_finish(void)
+{
+    if (game_score > best_catch) {
+        best_catch = game_score;
+        score_store(&ee_catch, best_catch);
+    }
+    game_state = GAME_CATCH_OVER;
+    ui_dirty |= UI_BAND_ALL;
+}
+
+static void activity_input(int8_t steps, uint8_t press, uint16_t now)
+{
+    uint8_t i;
+    if (robot_mode == MODE_POMODORO) {
+        if (pomo_state == POMO_MINUTES) {
+            pomo_minutes = selection_wrap(pomo_minutes, steps, 100u);
+            if (press) pomo_state = POMO_SECONDS;
+        } else if (pomo_state == POMO_SECONDS) {
+            pomo_seconds = selection_wrap(pomo_seconds, steps, 60u);
+            if (press) {
+                pomo_total = (uint16_t)pomo_minutes * 60u + pomo_seconds;
+                if (pomo_total != 0u) {
+                    pomo_remaining = pomo_total;
+                    pomo_fraction_us = 0UL;
+                    activity_last_tick = now;
+                    pomo_state = POMO_RUNNING;
+                }
+            }
+        } else if (press) {
+            /* Push cancels/acknowledges and opens the mode selector. */
+            pomo_state = POMO_MINUTES;
+            activity_open_modes(now);
+        }
+    } else if (game_state == GAME_MENU) {
+        game_cursor = selection_wrap(game_cursor, steps, 4u);
+        if (press) {
+            if (game_cursor == 0u) {
+                game_score = 0u; game_lives = 3u; paddle_x = 55u;
+                for (i = 0u; i < 3u; ++i) {
+                    balls[i].x = (uint8_t)(26u + activity_random() % 76u);
+                    balls[i].y = (int8_t)(17 - (int8_t)i * 13);
+                }
+                activity_last_tick = now;
+                game_state = GAME_CATCH;
+            } else if (game_cursor == 1u) game_state = GAME_TIMING_READY;
+            else if (game_cursor == 2u) game_state = GAME_SCORES;
+            else activity_open_modes(now);
+        }
+    } else if (game_state == GAME_CATCH) {
+        int16_t x = (int16_t)paddle_x + (int16_t)steps * 4;
+        if (x < 24) x = 24;
+        if (x > 86) x = 86; /* 18-pixel paddle fits the 80-pixel arena. */
+        paddle_x = (uint8_t)x;
+        if (press) catch_finish();
+    } else if (game_state == GAME_TIMING_READY) {
+        /* Rotation returns to the game list; push starts a five-second round. */
+        if (steps) game_state = GAME_MENU;
+        else if (press) {
+            uint8_t saved = SREG;
+            cli();
+            rx_started = system_ticks_2ms;
+            rx_phase = RX_COUNTDOWN;
+            SREG = saved;
+            reaction_countdown = 5u;
+            game_state = GAME_TIMING_ACTIVE;
+        }
+    } else if (press) {
+        activity_stop();
+        game_state = GAME_MENU;
+    }
+    if (steps || press) ui_dirty |= UI_BAND_ALL;
+}
+
+static void activity_service(uint16_t now)
+{
+    if (robot_mode == MODE_POMODORO) {
+        if (pomo_state == POMO_RUNNING) {
+            uint16_t delta = (uint16_t)(now - activity_last_tick);
+            activity_last_tick = now;
+            /* Exact 2.048-ms tick conversion, preserving the remainder.
+             * Accumulated elapsed time handles the 16-bit tick wrap and
+             * countdowns longer than 134 seconds without rounding drift. */
+            pomo_fraction_us += (uint32_t)delta * 2048UL;
+            while (pomo_fraction_us >= 1000000UL && pomo_remaining) {
+                pomo_fraction_us -= 1000000UL;
+                --pomo_remaining;
+                ui_dirty |= UI_BAND_ALL;
+            }
+            if (!pomo_remaining) {
+                pomo_state = POMO_DONE;
+                pomo_alarm_tick = now;
+                buzzer_beep(122u);
+            }
+        } else if (pomo_state == POMO_DONE &&
+                   (uint16_t)(now - pomo_alarm_tick) >= 488u) {
+            pomo_alarm_tick = now;
+            buzzer_beep(122u);
+        }
+    } else if (robot_mode == MODE_GAME && game_state == GAME_CATCH) {
+        uint8_t i;
+        uint16_t interval = game_score < 400u ?
+            (uint16_t)(60u - game_score / 20u) : 40u;
+        if ((uint16_t)(now - activity_last_tick) < interval) return;
+        activity_last_tick = now;
+        for (i = 0u; i < 3u; ++i) {
+            if (++balls[i].y >= 43) {
+                if ((uint16_t)balls[i].x + 1u >= paddle_x &&
+                    balls[i].x <= (uint16_t)paddle_x + 18u) {
+                    if (game_score <= 65520u) game_score += 10u;
+                } else if (--game_lives == 0u) {
+                    catch_finish();
+                    break;
+                }
+                balls[i].x = (uint8_t)(26u + activity_random() % 76u);
+                balls[i].y = (int8_t)(12 - (int8_t)(activity_random() % 8u));
+                ui_dirty |= UI_BAND_ALL;
+            }
+        }
+    } else if (robot_mode == MODE_GAME && game_state == GAME_TIMING_ACTIVE) {
+        uint8_t saved = SREG, phase;
+        uint16_t started, hit;
+        cli();
+        phase = rx_phase; started = rx_started; hit = rx_hit_tick;
+        now = system_ticks_2ms;
+        SREG = saved;
+        if (phase == RX_COUNTDOWN) {
+            uint8_t n = (uint8_t)(5u -
+                ((uint32_t)(uint16_t)(now - started) * 2048UL / 1000000UL));
+            if (n != reaction_countdown) {
+                reaction_countdown = n;
+                ui_dirty |= UI_BAND_ALL;
+            }
+        } else if (phase == RX_WAIT) {
+            if (reaction_countdown) {
+                reaction_countdown = 0u;
+                ui_dirty |= UI_BAND_ALL;
+            }
+        } else if (phase == RX_HIT || phase == RX_EARLY || phase == RX_TIMEOUT) {
+            reaction_result = phase;
+            if (phase == RX_HIT) {
+                reaction_ms = (uint16_t)(
+                    ((uint32_t)(uint16_t)(hit - started) * 2048UL + 500UL) / 1000UL);
+                reaction_score = timing_score(reaction_ms);
+                if (!best_reaction_ms || reaction_ms < best_reaction_ms) {
+                    best_reaction_ms = reaction_ms;
+                    score_store(&ee_reaction, best_reaction_ms);
+                }
+            }
+            rx_phase = RX_OFF;
+            game_state = GAME_TIMING_RESULT;
+            ui_dirty |= UI_BAND_ALL;
+        }
+    }
+}
+
 static void mode_set(robot_mode_t mode, uint16_t now)
 {
     if (mode == robot_mode) {
         return;
     }
+    activity_stop();
+    cliff_backup_authorized = 0u;
     robot_mode = mode;
     ui_dirty |= UI_BAND_ALL;
-    if (mode == MODE_WEATHER) {
+    if (mode != MODE_ROAM) {
         motors_set_targets(0, 0);      /* Immediate dynamic brake, then hold. */
-        weather_begin();
+        if (mode == MODE_WEATHER) weather_begin();
+        else activity_begin(now);
     } else {
         robot_begin(now);              /* Normal safe restart, incl. cliff check. */
     }
@@ -1481,6 +2145,11 @@ static void ui_service(uint16_t now)
     uint8_t press;
 
     encoder_take(&steps, &press);
+    if (ui_state == UI_HIDDEN &&
+        (robot_mode == MODE_POMODORO || robot_mode == MODE_GAME)) {
+        activity_input(steps, press, now);
+        return;
+    }
 
     if (steps != 0) {
         int16_t position;
@@ -2146,10 +2815,46 @@ static face_mode_t weather_face(void)
     }
 }
 
+static face_mode_t pomodoro_face(uint16_t now)
+{
+    static uint8_t old_stage = 255u;
+    static uint16_t changed_at = 0u, wait = 0u;
+    static face_mode_t choice = FACE_DRIVE;
+    uint8_t stage;
+    if (pomo_state == POMO_DONE) return FACE_PET;
+    if (pomo_state != POMO_RUNNING) return FACE_CURIOUS;
+    stage = pomo_remaining <= 10u ? 3u :
+        ((uint32_t)pomo_remaining * 4u <= pomo_total ? 2u :
+        ((uint32_t)pomo_remaining * 2u <= pomo_total ? 1u : 0u));
+    if (stage != old_stage || (uint16_t)(now - changed_at) >= wait) {
+        uint8_t pick = (uint8_t)(eye_random() % 3u);
+        old_stage = stage;
+        changed_at = now;
+        wait = (uint16_t)(700u + eye_random() % 800u);
+        if (stage == 0u) choice = pick == 0u ? FACE_WX_COMFORT :
+                                  pick == 1u ? FACE_DRIVE : FACE_CURIOUS;
+        else if (stage == 1u) choice = pick == 0u ? FACE_AVOID :
+                                       pick == 1u ? FACE_DRIVE : FACE_CURIOUS;
+        else if (stage == 2u) choice = pick == 0u ? FACE_WX_HOT :
+                                       pick == 1u ? FACE_AVOID : FACE_CURIOUS;
+        else choice = pick == 0u ? FACE_STARTLED :
+                      pick == 1u ? FACE_CLIFF : FACE_AVOID;
+    }
+    return choice;
+}
+
 static void robot_expression_service(touch_state_t touch, uint16_t now)
 {
     action_t action = ACTION_DRIVE;
     face_mode_t mode = FACE_DRIVE;
+    if (robot_mode == MODE_POMODORO || robot_mode == MODE_GAME) {
+        servos_update(ACTION_DRIVE, TOUCH_NONE, now);
+        face_touch = TOUCH_NONE;
+        face_turn_left = 0u;
+        mode = robot_mode == MODE_POMODORO ? pomodoro_face(now) : FACE_CURIOUS;
+        eyes_set_mode(dizzy_overlay ? FACE_DIZZY : mode, now);
+        return;
+    }
     if (robot_mode == MODE_WEATHER) {
         /* Stationary: servos stay home and touch is ignored.  The condition's
          * expression is shown unless a shake overlays the dizzy reaction. */
@@ -2252,11 +2957,11 @@ static void draw_eye_shape(const eye_shape_t *eye)
     }
 }
 
-static void eye_buffer_hspan(int16_t x1, int16_t x2, int16_t y)
+static void eye_buffer_hspan(uint8_t x1, uint8_t x2, uint8_t y)
 {
-    int16_t x;
+    uint16_t x;
     if (x2 < x1) {
-        int16_t t = x1;
+        uint8_t t = x1;
         x1 = x2;
         x2 = t;
     }
@@ -2364,6 +3069,21 @@ static void eyes_render_frame(void)
     if (frame_drop_r) draw_drop(98, frame_drop_r);
 }
 
+static void catch_render_frame(void)
+{
+    uint8_t i;
+    eye_buffer_clear();
+    for (i = 0u; i < 3u; ++i) {
+        int16_t x = balls[i].x, y = balls[i].y;
+        if (y < 17) continue;
+        eye_buffer_span(x - 1, y, y);
+        eye_buffer_span(x, y - 1, y + 1);
+        eye_buffer_span(x + 1, y, y);
+    }
+    for (i = 44u; i <= 46u; ++i)
+        eye_buffer_hspan(paddle_x, (uint8_t)(paddle_x + 17u), i);
+}
+
 static void oled_animation_service(void)
 {
     uint8_t display_page;
@@ -2371,8 +3091,13 @@ static void oled_animation_service(void)
     /* Keep every frame stable until all four pages finish, including changes
      * of expression during a transfer. New poses are sampled at a boundary. */
     if (eye_page_index == 0u) {
-        eyes_advance_frame(system_ticks_read());
-        eyes_render_frame();
+        if (robot_mode == MODE_GAME &&
+            (game_state == GAME_CATCH || game_state == GAME_CATCH_OVER)) {
+            catch_render_frame();
+        } else {
+            eyes_advance_frame(system_ticks_read());
+            eyes_render_frame();
+        }
     }
     display_page = (uint8_t)(OLED_FIRST_EYE_PAGE + eye_page_index);
     if (!oled_set_position(display_page, OLED_EYE_X) ||
@@ -2460,12 +3185,18 @@ static const uint8_t ui_font[60][5] PROGMEM = {
 
 static const char ui_name_roam[] PROGMEM = "ROAM";
 static const char ui_name_weather[] PROGMEM = "WEATHER";
-/* The menu draws one mode per row on pages 0 and 1. */
-typedef char ui_menu_fits_two_rows[(MODE_COUNT <= 2) ? 1 : -1];
+static const char ui_name_pomodoro[] PROGMEM = "POMODORO";
+static const char ui_name_game[] PROGMEM = "GAME";
+/* Scroll the two visible rows as the mode selection changes. */
 
 static const char *ui_mode_name(uint8_t mode)
 {
-    return mode == MODE_WEATHER ? ui_name_weather : ui_name_roam;
+    switch (mode) {
+    case MODE_WEATHER: return ui_name_weather;
+    case MODE_POMODORO: return ui_name_pomodoro;
+    case MODE_GAME: return ui_name_game;
+    default: return ui_name_roam;
+    }
 }
 
 static uint8_t ui_str_len(const char *s, uint8_t in_flash)
@@ -2537,6 +3268,97 @@ static char *ui_put_number(char *p, uint8_t value)
     return p;
 }
 
+static void ui_value(const char *label, uint16_t value, const char *suffix)
+{
+    char digits[6], *p = &digits[5];
+    uint8_t len;
+    *p = '\0';
+    do { *--p = (char)('0' + value % 10u); value /= 10u; } while (value);
+    ui_text(label, 1u, 0u, 1u, 0u);
+    len = ui_str_len(label, 1u);
+    ui_text(p, 0u, (uint16_t)len * 6u, 1u, 0u);
+    ui_text(suffix, 1u, (uint16_t)(len + ui_str_len(p, 0u)) * 6u, 1u, 0u);
+}
+
+static const char *game_item_name(uint8_t item)
+{
+    switch (item) {
+    case 0u: return PSTR("CATCH BALLS");
+    case 1u: return PSTR("FIND YOUR TIMING");
+    case 2u: return PSTR("HIGH SCORES");
+    default: return PSTR("BACK");
+    }
+}
+
+static void activity_render_page(uint8_t page)
+{
+    const char *label = 0;
+    if (robot_mode == MODE_POMODORO) {
+        if (page <= 1u) {
+            char clock_text[6];
+            uint16_t secs = (pomo_state == POMO_RUNNING || pomo_state == POMO_DONE)
+                ? pomo_remaining : (uint16_t)pomo_minutes * 60u + pomo_seconds;
+            uint8_t m = (uint8_t)(secs / 60u), sec = (uint8_t)(secs % 60u);
+            clock_text[0] = (char)('0' + m / 10u);
+            clock_text[1] = (char)('0' + m % 10u); clock_text[2] = ':';
+            clock_text[3] = (char)('0' + sec / 10u);
+            clock_text[4] = (char)('0' + sec % 10u); clock_text[5] = '\0';
+            ui_text_centered(clock_text, 0u, 2u, page);
+        } else if (page == 6u) {
+            label = pomo_state == POMO_MINUTES ? PSTR("SET MINUTES") :
+                    pomo_state == POMO_SECONDS ? PSTR("SET SECONDS") :
+                    pomo_state == POMO_RUNNING ? PSTR("FOCUS TIME") : PSTR("TIME IS UP!");
+        } else {
+            label = pomo_state == POMO_MINUTES ? PSTR("PUSH: NEXT") :
+                    pomo_state == POMO_SECONDS ? PSTR("PUSH: START >00:00") :
+                    pomo_state == POMO_RUNNING ? PSTR("PUSH: CANCEL / MENU") :
+                    PSTR("PUSH: SILENCE / MENU");
+        }
+    } else if (game_state == GAME_MENU) {
+        if (page <= 1u) {
+            uint8_t item = (uint8_t)((game_cursor / 2u) * 2u + page);
+            if (item == game_cursor) ui_text(PSTR(">"), 1u, 0u, 1u, 0u);
+            ui_text(game_item_name(item), 1u, 12u, 1u, 0u);
+        } else if (page == 6u) label = PSTR("GAME");
+        else label = PSTR("TURN / PUSH SELECT");
+    } else if (game_state == GAME_CATCH || game_state == GAME_CATCH_OVER) {
+        if (page == 0u) ui_value(PSTR("SCORE "), game_score, PSTR(""));
+        else if (page == 1u) ui_value(PSTR("LIVES "), game_lives, PSTR(""));
+        else if (page == 6u) label = game_state == GAME_CATCH ?
+            PSTR("TURN TO CATCH") : PSTR("ROUND OVER");
+        else label = game_state == GAME_CATCH ? PSTR("PUSH: END ROUND") : PSTR("PUSH: GAME MENU");
+    } else if (game_state == GAME_TIMING_READY) {
+        if (page == 0u) label = PSTR("FIND YOUR TIMING");
+        else if (page == 1u) label = PSTR("RELEASE BOTH PADS");
+        else if (page == 6u) label = PSTR("PUSH: 5 SEC START");
+        else label = PSTR("TURN: BACK");
+    } else if (game_state == GAME_TIMING_ACTIVE) {
+        if (page == 0u) label = PSTR("FIND YOUR TIMING");
+        else if (page == 1u) {
+            if (reaction_countdown) ui_value(PSTR("WAIT "), reaction_countdown, PSTR(" SEC"));
+            else label = PSTR("TOUCH NOW!");
+        } else if (page == 6u) label = PSTR("TOUCH EITHER PAD");
+        else label = PSTR("PUSH: CANCEL");
+    } else if (game_state == GAME_TIMING_RESULT) {
+        if (page == 0u) {
+            if (reaction_result == RX_HIT) ui_value(PSTR("TIME "), reaction_ms, PSTR(" MS"));
+            else label = reaction_result == RX_EARLY ? PSTR("TOO EARLY!") : PSTR("TIMED OUT");
+        } else if (page == 1u && reaction_result == RX_HIT)
+            ui_value(PSTR("SCORE "), reaction_score, PSTR(""));
+        else if (page == 6u) label = PSTR("FASTER = MORE POINTS");
+        else if (page == 7u) label = PSTR("PUSH: GAME MENU");
+    } else if (game_state == GAME_SCORES) {
+        if (page == 0u) ui_value(PSTR("CATCH BEST "), best_catch, PSTR(""));
+        else if (page == 1u) {
+            if (best_reaction_ms) ui_value(PSTR("FASTEST "), best_reaction_ms, PSTR(" MS"));
+            else label = PSTR("NO TIMING RECORD");
+        } else if (page == 6u && best_reaction_ms)
+            ui_value(PSTR("TIMING BEST "), timing_score(best_reaction_ms), PSTR(""));
+        else if (page == 7u) label = PSTR("PUSH: GAME MENU");
+    }
+    if (label) ui_text_centered(label, 1u, 1u, 0u);
+}
+
 static void ui_render_page(uint8_t page)
 {
     char text[8];
@@ -2550,18 +3372,23 @@ static void ui_render_page(uint8_t page)
 
     if (ui_state == UI_MENU) {
         if (page <= 1u) {
-            const char *name = ui_mode_name(page);
+            uint8_t item = (uint8_t)((ui_cursor / 2u) * 2u + page);
+            const char *name = ui_mode_name(item);
             len = ui_str_len(name, 1u);
-            if (ui_cursor == page) {
+            if (ui_cursor == item) {
                 ui_text(PSTR(">"), 1u, 16u, 1u, 0u);
             }
             ui_text(name, 1u, 28u, 1u, 0u);
-            if ((uint8_t)robot_mode == page) {          /* Active mode. */
+            if ((uint8_t)robot_mode == item) {          /* Active mode. */
                 ui_text(PSTR("*"), 1u, (uint16_t)(28u + len * 6u + 4u), 1u, 0u);
             }
         } else if (page == 7u) {
             ui_text_centered(PSTR("PUSH TO SELECT"), 1u, 1u, 0u);
         }
+        return;
+    }
+    if (robot_mode == MODE_POMODORO || robot_mode == MODE_GAME) {
+        activity_render_page(page);
         return;
     }
     if (robot_mode != MODE_WEATHER) {
@@ -2658,6 +3485,10 @@ int main(void)
     shock_init();
     encoder_init();                    /* After shock_init(): JTAG is off. */
     dht_init();
+    buzzer_init();
+    best_catch = score_load(&ee_catch);
+    best_reaction_ms = score_load(&ee_reaction);
+    if (best_reaction_ms > 10000u) best_reaction_ms = 0u;
     sei();
 
     /* Motors remain actively braked during display power-up/recovery. */
@@ -2685,6 +3516,7 @@ int main(void)
         }
 
         ui_service(now);                /* KY-040: menu and mode changes. */
+        activity_service(system_ticks_read());
         microphone_service(now);
         /* Apply known safety/touch/sound state before another sonar sample. */
         robot_update(now, touch_state);
@@ -2705,4 +3537,153 @@ int main(void)
         /* No behavior delays here: all pause/turn/ramp deadlines are timed.
          * OLED page I/O and bounded sonar polling leave Timer2 IRQ enabled. */
     }
+}
+
+#undef main
+static void tick(unsigned n) {
+    while (n--) { ++system_ticks_2ms; activities_tick_isr(); }
+}
+static void surface(uint8_t cliff) {
+    PINB = cliff ? (_BV(IR_FL_PIN) | _BV(IR_FR_PIN)) : 0;
+}
+static void test_timer(void) {
+    robot_mode = MODE_ROAM;
+    system_ticks_2ms = 65000u;
+    mode_set(MODE_POMODORO, system_ticks_2ms);
+    assert(!motor_target_a && !motor_target_b && !cliff_backup_authorized);
+    pomo_minutes = 0; pomo_seconds = 0;
+    activity_input(-1, 0, system_ticks_2ms);
+    assert(pomo_minutes == 99);
+    activity_input(0, 1, system_ticks_2ms);
+    activity_input(-1, 0, system_ticks_2ms);
+    assert(pomo_state == POMO_SECONDS && pomo_seconds == 59);
+    activity_input(0, 1, system_ticks_2ms);
+    assert(pomo_remaining == 5999 && pomo_state == POMO_RUNNING);
+    unsigned long ticks = 0;
+    while (pomo_state == POMO_RUNNING) {
+        tick(1); activity_service(system_ticks_2ms); ++ticks;
+    }
+    assert(ticks == (5999000000ULL + 2047) / 2048);
+    assert(!pomo_remaining && buzzer_ticks == 122);
+    assert(PORTA & _BV(PA3));
+    tick(122); assert(!(PORTA & _BV(PA3)));
+    tick(366); activity_service(system_ticks_2ms);
+    assert(buzzer_ticks == 122);
+    activity_input(0, 1, system_ticks_2ms);
+    assert(ui_state == UI_MENU && !buzzer_ticks);
+    pomo_minutes = pomo_seconds = 0; pomo_state = POMO_SECONDS;
+    activity_input(0, 1, system_ticks_2ms);
+    assert(pomo_state == POMO_SECONDS); /* Reject zero duration. */
+    mode_set(MODE_ROAM, system_ticks_2ms);
+    assert(robot_state == STATE_STARTUP && !motor_target_a && !motor_target_b);
+}
+static void start_reaction(void) {
+    PINA = 0; robot_mode = MODE_GAME; game_state = GAME_TIMING_READY;
+    activity_input(0, 1, system_ticks_2ms);
+    assert(rx_phase == RX_COUNTDOWN);
+}
+static void test_reaction(void) {
+    system_ticks_2ms = 64000u;
+    start_reaction();
+    tick(2441); assert(rx_phase == RX_COUNTDOWN && !buzzer_ticks);
+    tick(1); assert(rx_phase == RX_WAIT && buzzer_ticks == 60);
+    tick(100); PINA = _BV(PA0); tick(9);
+    assert(rx_phase == RX_HIT);
+    /* Main loop delayed by OLED I/O: result still uses the first touch edge. */
+    tick(1000); activity_service(system_ticks_2ms);
+    assert(reaction_ms == 207 && reaction_score == 9793);
+    assert(best_reaction_ms == 207 && score_load(&ee_reaction) == 207);
+    unsigned writes = eeprom_writes;
+    start_reaction(); tick(2442); tick(200);
+    PINA = _BV(PA1); tick(9); activity_service(system_ticks_2ms);
+    assert(reaction_ms == 412 && best_reaction_ms == 207);
+    assert(eeprom_writes == writes);
+    start_reaction(); PINA = _BV(PA1); tick(1);
+    activity_service(system_ticks_2ms);
+    assert(reaction_result == RX_EARLY && best_reaction_ms == 207);
+    start_reaction(); tick(2442);
+    PINA = _BV(PA0); tick(3); PINA = 0; tick(1); /* Reject short glitch. */
+    assert(rx_phase == RX_WAIT);
+    tick(4883); activity_service(system_ticks_2ms);
+    assert(reaction_result == RX_TIMEOUT && best_reaction_ms == 207);
+    start_reaction(); activity_stop(); tick(2442);
+    assert(rx_phase == RX_OFF && !buzzer_ticks);
+}
+static void test_catch(void) {
+    robot_mode = MODE_GAME; game_state = GAME_MENU; game_cursor = 0;
+    activity_input(0, 1, system_ticks_2ms);
+    assert(game_lives == 3 && game_state == GAME_CATCH);
+    activity_input(-127, 0, system_ticks_2ms); assert(paddle_x == 24);
+    activity_input(127, 0, system_ticks_2ms); assert(paddle_x == 86);
+    balls[0] = (ball_t){90, 42}; balls[1].y = balls[2].y = -30;
+    tick(60); activity_service(system_ticks_2ms);
+    assert(game_score == 10 && game_lives == 3);
+    for (unsigned i = 0; i < 3; ++i) {
+        balls[0] = (ball_t){30, 42};
+        tick(60); activity_service(system_ticks_2ms);
+    }
+    assert(game_state == GAME_CATCH_OVER && game_lives == 0);
+    assert(best_catch == 10 && score_load(&ee_catch) == 10);
+    activity_input(0, 1, system_ticks_2ms); assert(game_state == GAME_MENU);
+    game_cursor = 2; activity_input(0, 1, system_ticks_2ms);
+    assert(game_state == GAME_SCORES);
+    ee_catch = (score_record_t){0xFFFF, 0xFFFF}; assert(!score_load(&ee_catch));
+    ee_catch = (score_record_t){30, 0}; assert(!score_load(&ee_catch));
+}
+static void test_cliff_and_modes(void) {
+    uint8_t directions = 0;
+    robot_mode = MODE_ROAM;
+    for (unsigned i = 0; i < 16; ++i) {
+        surface(1); cliff_latched = 1; surface_stable_ticks = 0;
+        robot_state = STATE_CRUISE; cliff_backup_attempts = 0; cliff_turn_needed = 0;
+        sonar_status = SONAR_FAULT; /* Fault must not truncate edge retreat. */
+        uint16_t start = (uint16_t)(64000u + i * 100u);
+        robot_update(start, TOUCH_NONE); assert(robot_state == STATE_CLIFF);
+        robot_update(start + CLIFF_CONFIRM_TICKS, TOUCH_NONE);
+        assert(robot_state == STATE_CLIFF_BACKUP && state_duration == 400);
+        assert(motor_reverse && motor_target_a == 60 && motor_target_b == 60);
+        assert(cliff_backup_authorized && cliff_turn_needed);
+        directions |= (uint8_t)(1u << cliff_turn_left);
+        uint16_t backup_start = state_since;
+        surface(0); surface_stable_ticks = IR_SURFACE_STABLE_TICKS;
+        robot_update(backup_start + 399u, TOUCH_NONE);
+        assert(robot_state == STATE_CLIFF_BACKUP);
+        robot_update(backup_start + 400u, TOUCH_NONE);
+        assert(robot_state == STATE_CLIFF && !cliff_backup_authorized);
+        sonar_status = SONAR_CLEAR; sonar_obstacle = 0; avoidance_blocked = 0;
+        sonar_last_sample_tick = backup_start + 401u;
+        robot_update(backup_start + 401u, TOUCH_NONE);
+        assert(robot_state == STATE_CLIFF_TURN && !cliff_latched);
+        assert((motor_target_a == 0 && motor_target_b == CLIFF_TURN_PWM) ||
+               (motor_target_b == 0 && motor_target_a == CLIFF_TURN_PWM));
+        uint16_t turn_start = state_since;
+        sonar_last_sample_tick = turn_start + CLIFF_TURN_TICKS;
+        robot_update(turn_start + CLIFF_TURN_TICKS, TOUCH_NONE);
+        assert(robot_state == STATE_SETTLE && !motor_target_a && !motor_target_b);
+    }
+    assert(directions == 3);
+    /* Stuck edge: capped retries, then brake. */
+    surface(1); cliff_latched = 1; surface_stable_ticks = 0;
+    cliff_backup_attempts = 0; cliff_turn_needed = 0; robot_state = STATE_CRUISE;
+    uint16_t now = 1000; robot_update(now, TOUCH_NONE);
+    for (unsigned i = 0; i < CLIFF_BACKUP_MAX_ATTEMPTS; ++i) {
+        now += CLIFF_CONFIRM_TICKS; robot_update(now, TOUCH_NONE);
+        assert(robot_state == STATE_CLIFF_BACKUP && state_duration <= 680);
+        now += state_duration; robot_update(now, TOUCH_NONE);
+        assert(robot_state == STATE_CLIFF && !cliff_backup_authorized);
+    }
+    now += 1000; robot_update(now, TOUCH_NONE);
+    assert(robot_state == STATE_CLIFF && !motor_target_a && !motor_target_b);
+    /* Every new stationary mode cancels a live retreat. */
+    for (unsigned m = MODE_WEATHER; m < MODE_COUNT; ++m) {
+        robot_mode = MODE_ROAM; cliff_backup_authorized = 1;
+        motors_set_targets_reverse(60, 60); mode_set((robot_mode_t)m, now);
+        robot_update(now + 5000u, TOUCH_BOTH);
+        assert(!cliff_backup_authorized && !motor_target_a && !motor_target_b);
+    }
+}
+int main(void) {
+    test_timer(); test_reaction(); test_catch(); test_cliff_and_modes();
+    puts("PASS: long timer/wrap, buzzer, reaction ISR/early/timeout, catch/scores, cliff/retries/mode brakes");
+    return 0;
 }
