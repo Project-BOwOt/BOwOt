@@ -107,7 +107,7 @@
 
 /* Default TTP223 boards are momentary and active HIGH. */
 #define TOUCH_ACTIVE_HIGH            1u
-#define TOUCH_DEBOUNCE_TICKS         8u    /* About 16.4 ms. */
+#define TOUCH_DEBOUNCE_TICKS         80u    /* About 16.4 ms. */
 #define TOUCH_STARTUP_IGNORE_TICKS   250u  /* About 0.51 s calibration time. */
 
 /* MAX9814 OUT -> PA2/ADC2. Threshold units are 8-bit ADC peak-to-peak,
@@ -506,7 +506,7 @@ static inline void shock_sample_isr(void);
 static inline void encoder_sample_isr(void);
 static inline void activities_tick_isr(void);
 
-#define BUZZER_PIN PA3
+#define BUZZER_PIN PA7
 #define BUZZER_ACTIVE_HIGH 1u /* Set 0 for an active-LOW three-pin module. */
 #define REACTION_COUNTDOWN_TICKS 2442u /* ceil(5 s / 2.048 ms). */
 #define REACTION_TIMEOUT_TICKS 4883u   /* 10 seconds after the cue. */
